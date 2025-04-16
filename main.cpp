@@ -1,10 +1,9 @@
 /*******************************************************************************************
 *
-* Raylib Global Illumination Demo (Translation from JS/Three.js)
+* Raylib Global Illumination, adapted to c++/raylib/opengl from the excellent 
+* js/threejs/webgl interractive article at https://jason.today/gi
 *
-* This example translates the core concepts of a real-time global illumination
-* demo originally written in JavaScript and Three.js. It utilizes Raylib for
-* windowing, input, rendering, and shader management.
+* With help from Gemini 2.5 pro to bootstrap the plumbing
 *
 * Core Pipeline:
 * 1. Drawing Surface: User draws onto a texture using the mouse.
@@ -13,40 +12,32 @@
 * 4. Distance Field: Calculates distance to the nearest seed UV.
 * 5. GI Raymarch: Performs raymarching using the distance field for acceleration.
 *
-* Compile example using:
-* g++ main.cpp -o gi_demo -lraylib -lGL -lm -lpthread -ldl -lrt -lX11 -std=c++17
-* (Ensure Raylib is installed and linked correctly)
-*
-* Copyright (c) 2024 Ramon Santamaria (@raysan5),
-* 2023 Jason McGhee (Original JS version),
-* 2024 Gemini (Translation & Fixes)
-*
 ********************************************************************************************/
 
 #include "raylib.h"
-#include "raymath.h" // Required for Vector2 functions, defines PI
-#include "rlgl.h"    // Required for direct OpenGL functions/constants if needed, and RL_CLAMP
+#include "raymath.h" // For Vector2DistanceSqr
+#define RAYGUI_IMPLEMENTATION
+#include "raygui.h" // For checkboxes, buttons and sliders
+
 #include <cmath>     // For log2, pow, ceil
 #include <vector>
 #include <string>
 
-// Use Raylib's rlgl module for advanced features if needed, but try to stick to core Raylib
-#define RAYGUI_IMPLEMENTATION
-#include "raygui.h" // Required for UI controls
-
 //----------------------------------------------------------------------------------
 // Defines and Macros
 //----------------------------------------------------------------------------------
-#define MAX_RAYMARCH_STEPS 48
+#define MAX_JFA_PASSES 12 // Should be ceil(log2(max(width, height)))
 #define INITIAL_RAYMARCH_STEPS 32
-#define MAX_JFA_PASSES 10 // Should be ceil(log2(max(width, height)))
-#define TAU (2.0f * PI)   // Define TAU
+#define MAX_RAYMARCH_STEPS 48 // limit in the gui
+#define TAU (2.0f * PI)
 
 //----------------------------------------------------------------------------------
 // Shader Code (GLSL 330)
 //----------------------------------------------------------------------------------
 
 // --- Common Vertex Shader ---
+// reverse the Y axis (raylib vs opengl coordinates), so each texture can naturally
+// sample each other
 const char *vertexShaderSrc = R"(
 #version 330 core
 layout (location = 0) in vec3 vertexPosition;
@@ -58,7 +49,10 @@ uniform mat4 mvp; // Raylib default MVP uniform
 
 void main()
 {
-    fragTexCoord = vertexTexCoord;
+    // Flip texture vertically
+    fragTexCoord = vec2(vertexTexCoord.x, 1.0 - vertexTexCoord.y);
+
+    // Keep output position the same
     gl_Position = mvp * vec4(vertexPosition, 1.0);
 }
 )";
@@ -82,8 +76,6 @@ float sdfLineSquared(vec2 p, vec2 from, vec2 to) {
     vec2 toStart = p - from;
     vec2 line = to - from;
     float lineLengthSquared = dot(line, line);
-    // Avoid division by zero for zero-length lines (points)
-    if (lineLengthSquared < 0.0001) return dot(toStart, toStart);
     float t = clamp(dot(toStart, line) / lineLengthSquared, 0.0, 1.0);
     vec2 closestVector = toStart - line * t;
     return dot(closestVector, closestVector);
@@ -91,15 +83,12 @@ float sdfLineSquared(vec2 p, vec2 from, vec2 to) {
 
 void main()
 {
+    //vec2 fragTexCoordYFlip = vec2(fragTexCoord.x, resolution.y - fragTexCoord.y);
+    // \-> flipped in the vertex shader now, so each texture can naturally index each other
     vec4 current = texture(inputTexture, fragTexCoord);
     if (isDrawing) {
         vec2 pixelCoord = fragTexCoord * resolution;
-        // Flip Y coordinate as texture coords usually start from top-left,
-        // while mouse coords start from top-left in window space.
-        vec2 fromFlipped = vec2(fromPos.x, resolution.y - fromPos.y);
-        vec2 toFlipped = vec2(toPos.x, resolution.y - toPos.y);
-
-        if (sdfLineSquared(pixelCoord, fromFlipped, toFlipped) <= radiusSquared) {
+        if (sdfLineSquared(pixelCoord, fromPos, toPos) <= radiusSquared) {
             current = vec4(drawColor, 1.0);
         }
     }
@@ -343,8 +332,7 @@ void main()
 //----------------------------------------------------------------------------------
 typedef struct AppState {
     // Textures & Render Targets
-    RenderTexture2D drawSurfaceA;       // Ping-pong buffer for drawing
-    RenderTexture2D drawSurfaceB;
+    RenderTexture2D drawSurface;
     RenderTexture2D seedTexture;        // Stores initial UVs for JFA
     RenderTexture2D jfaTextureA;        // Ping-pong buffers for JFA
     RenderTexture2D jfaTextureB;
@@ -397,6 +385,7 @@ typedef struct AppState {
     float drawRadius;
     bool isDrawing;
     bool mouseMovedSinceClick;
+    int debugView;
 
 
     // GI Parameters / UI State
@@ -411,16 +400,11 @@ typedef struct AppState {
     float time; // For temporal accumulation noise
 
     // Control which buffer is current input/output
-    bool drawPingPong;
     bool jfaPingPong;
     bool giPingPong;
 
     // JFA calculation state
     int jfaPassesNeeded;
-
-    // Fullscreen Quad rendering data (using rlgl)
-    unsigned int quadVAO; // Vertex Array Object
-    unsigned int quadVBO; // Vertex Buffer Object
 
 } AppState;
 
@@ -431,8 +415,7 @@ void InitApp(AppState *state, int width, int height);
 void UpdateApp(AppState *state);
 void DrawApp(AppState *state, int width, int height);
 void DeInitApp(AppState *state);
-void InitFullscreenQuad(AppState *state); // Setup VAO/VBO for quad
-void DrawQuad(AppState *state); // Draw the quad using VAO
+void DrawQuad(AppState *state); // Draw final full screen quad
 
 
 //----------------------------------------------------------------------------------
@@ -442,8 +425,8 @@ int main(void)
 {
     // Initialization
     //--------------------------------------------------------------------------------------
-    const int screenWidth = 1024; // Adjust as needed
-    const int screenHeight = 768;
+    const int screenWidth = 1920; // Adjust as needed
+    const int screenHeight = 1080;
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT); // Enable VSYNC
     InitWindow(screenWidth, screenHeight, "Raylib Global Illumination Demo");
@@ -480,55 +463,15 @@ int main(void)
 // Module Functions Definition
 //----------------------------------------------------------------------------------
 
-void InitFullscreenQuad(AppState *state) {
-    // Simple quad vertices (covering -1 to 1 in clip space) and UVs (0 to 1)
-    // Using rlgl immediate mode style vertex definition for simplicity with Raylib shaders
-    // If using raw OpenGL calls, VAO/VBO setup is needed as before.
-    // Raylib's BeginShaderMode/EndShaderMode handles much of this when drawing primitives.
-    // However, for drawing a fullscreen quad efficiently without Raylib primitives,
-    // using a simple VAO/VBO setup directly with rlgl functions is often cleaner.
-
-    float quadVertices[] = {
-        // positions     // texture Coords (flipped Y for typical fullscreen shader pass)
-        -1.0f,  1.0f, 0.0f,  0.0f, 1.0f,
-        -1.0f, -1.0f, 0.0f,  0.0f, 0.0f,
-         1.0f, -1.0f, 0.0f,  1.0f, 0.0f,
-
-        -1.0f,  1.0f, 0.0f,  0.0f, 1.0f,
-         1.0f, -1.0f, 0.0f,  1.0f, 0.0f,
-         1.0f,  1.0f, 0.0f,  1.0f, 1.0f
-    };
-
-    // Use rlgl functions which are Raylib's wrapper around OpenGL
-    state->quadVAO = 0; // VAO is managed internally by rlgl for default batch rendering
-    state->quadVBO = rlLoadVertexBuffer(quadVertices, sizeof(quadVertices), false); // Dynamic=false
-
-    // Associate VBO with VAO attributes (position and texcoord)
-    // This setup is simplified as Raylib's shader system expects certain attribute locations (0 for pos, 1 for texcoord)
-    // We don't need explicit VAO management here if using DrawQuad function below which uses rlgl batching.
-}
-
 void DrawQuad(AppState *state) {
-     // Use rlgl functions to draw the quad using the loaded VBO
-     // This leverages Raylib's internal batching and shader setup
-     rlEnableVertexBuffer(state->quadVBO);
-     // We assume the shader attributes are correctly bound (loc 0: pos, loc 1: texcoord)
-     // Raylib's default shader locations match this.
-
-     // Set vertex attribute pointers with integer offsets
-     // This seems to be required based on the compiler error, even if non-standard for GL spec.
-     rlSetVertexAttribute(0, 3, RL_FLOAT, 0, 5 * sizeof(float), 0); // Offset 0 for position
-     rlEnableVertexAttribute(0);
-     rlSetVertexAttribute(1, 2, RL_FLOAT, 0, 5 * sizeof(float), (3 * sizeof(float))); // Offset (as int) for texcoord
-     rlEnableVertexAttribute(1);
-
-     rlDrawVertexArray(0, 6); // Draw the 6 vertices (2 triangles)
-
-     rlDisableVertexBuffer();
-     rlDisableVertexAttribute(0);
-     rlDisableVertexAttribute(1);
+     DrawTexture(state->seedTexture.texture, 0, 0, WHITE);
 }
 
+Shader defaultShader = LoadShader(0, 0);
+bool CheckShader(Shader shader)
+{
+    return !(shader.id == 0 || shader.id == defaultShader.id || !IsShaderValid(shader));
+}
 
 void InitApp(AppState *state, int width, int height) {
     // --- Initialize State ---
@@ -538,6 +481,7 @@ void InitApp(AppState *state, int width, int height) {
     state->drawRadius = 6.0f;
     state->isDrawing = false;
     state->mouseMovedSinceClick = false;
+    state->debugView = 0;
 
     state->showNoise = true;
     state->showGrain = true;
@@ -549,7 +493,6 @@ void InitApp(AppState *state, int width, int height) {
     state->rayCount = 32; // Number of rays for GI
     state->time = 0.0f;
 
-    state->drawPingPong = false;
     state->jfaPingPong = false;
     state->giPingPong = false;
 
@@ -563,6 +506,20 @@ void InitApp(AppState *state, int width, int height) {
     state->jfaShader = LoadShaderFromMemory(vertexShaderSrc, jfaFragShaderSrc);
     state->distanceFieldShader = LoadShaderFromMemory(vertexShaderSrc, distanceFieldFragShaderSrc);
     state->giShader = LoadShaderFromMemory(vertexShaderSrc, giFragShaderSrc);
+    
+    // --- Abort on load failure so we don't miss a shader compilation error ---
+    if (!CheckShader(state->drawShader) ||
+        !CheckShader(state->seedShader) ||
+        !CheckShader(state->jfaShader) ||
+        !CheckShader(state->distanceFieldShader) || 
+        !CheckShader(state->giShader)
+    ) {
+        TraceLog(LOG_ERROR, "Failed to find/compile a shader! Look above for the logs.");
+        std::abort();
+    }
+
+    Shader defaultShader = LoadShader(0, 0);
+    if (state->drawShader.id != 0 && state->drawShader.id == defaultShader.id || !IsShaderValid(state->drawShader)) {}
 
     // --- Get Shader Locations ---
     // Draw Shader
@@ -603,12 +560,9 @@ void InitApp(AppState *state, int width, int height) {
 
     // --- Create Render Targets ---
     // Use standard 8-bit format for drawing surface and final result
-    state->drawSurfaceA = LoadRenderTexture(width, height);
-    state->drawSurfaceB = LoadRenderTexture(width, height);
-    SetTextureFilter(state->drawSurfaceA.texture, TEXTURE_FILTER_POINT);
-    SetTextureFilter(state->drawSurfaceB.texture, TEXTURE_FILTER_POINT);
-    SetTextureWrap(state->drawSurfaceA.texture, TEXTURE_WRAP_CLAMP);
-    SetTextureWrap(state->drawSurfaceB.texture, TEXTURE_WRAP_CLAMP);
+    state->drawSurface = LoadRenderTexture(width, height);
+    SetTextureFilter(state->drawSurface.texture, TEXTURE_FILTER_POINT);
+    SetTextureWrap(state->drawSurface.texture, TEXTURE_WRAP_CLAMP);
 
     state->giResultA = LoadRenderTexture(width, height);
     state->giResultB = LoadRenderTexture(width, height);
@@ -618,11 +572,7 @@ void InitApp(AppState *state, int width, int height) {
     SetTextureWrap(state->giResultB.texture, TEXTURE_WRAP_CLAMP);
 
 
-    // Use floating point for intermediate JFA/Distance steps if precision is needed
-    // Check if PIXELFORMAT_UNCOMPRESSED_R32G32_FLOAT is available for just UVs if needed
-    // Using standard format here for broader compatibility, may lose precision.
-    // For high precision: use rlLoadRenderTexture(width, height, PIXELFORMAT_UNCOMPRESSED_R32G32B32A32, false);
-    // Note: rlLoadRenderTexture needs depth buffer flag (last arg)
+    // TODO: investigate the need for higher precision texture datatypes?
     state->seedTexture = LoadRenderTexture(width, height); // Use default format
     SetTextureFilter(state->seedTexture.texture, TEXTURE_FILTER_POINT);
     SetTextureWrap(state->seedTexture.texture, TEXTURE_WRAP_CLAMP);
@@ -640,17 +590,13 @@ void InitApp(AppState *state, int width, int height) {
 
 
     // Clear initial render textures
-    BeginTextureMode(state->drawSurfaceA); ClearBackground(BLANK); EndTextureMode();
-    BeginTextureMode(state->drawSurfaceB); ClearBackground(BLANK); EndTextureMode();
+    BeginTextureMode(state->drawSurface); ClearBackground(BLANK); EndTextureMode();
     BeginTextureMode(state->seedTexture); ClearBackground(BLANK); EndTextureMode();
     BeginTextureMode(state->jfaTextureA); ClearBackground(BLANK); EndTextureMode();
     BeginTextureMode(state->jfaTextureB); ClearBackground(BLANK); EndTextureMode();
     BeginTextureMode(state->distanceFieldTexture); ClearBackground(WHITE); EndTextureMode(); // Init distance with max
     BeginTextureMode(state->giResultA); ClearBackground(BLACK); EndTextureMode();
     BeginTextureMode(state->giResultB); ClearBackground(BLACK); EndTextureMode();
-
-    // Init fullscreen quad rendering helper
-    InitFullscreenQuad(state);
 }
 
 void UpdateApp(AppState *state) {
@@ -709,8 +655,9 @@ void UpdateApp(AppState *state) {
 
 
 void DrawApp(AppState *state, int width, int height) {
+    
     // --- Update Shader Uniforms ---
-    Vector2 resolution = {(float)state->drawSurfaceA.texture.width, (float)state->drawSurfaceA.texture.height};
+    Vector2 resolution = {(float)state->drawSurface.texture.width, (float)state->drawSurface.texture.height};
     Vector2 oneOverResolution = {1.0f / resolution.x, 1.0f / resolution.y};
     float radiusSquared = state->drawRadius * state->drawRadius;
     // Convert Color to vec3 for shader (normalize)
@@ -718,16 +665,13 @@ void DrawApp(AppState *state, int width, int height) {
 
 
     // --- 1. Drawing Pass ---
-    // Determine input/output textures for ping-pong
-    RenderTexture2D *drawInputTarget = state->drawPingPong ? &state->drawSurfaceB : &state->drawSurfaceA;
-    RenderTexture2D *drawOutputTarget = state->drawPingPong ? &state->drawSurfaceA : &state->drawSurfaceB;
 
     // Only perform draw pass if mouse was pressed or is being held down
     // Also draw one last segment on release if mouse didn't move (single click)
     bool performDrawPass = state->isDrawing || (IsMouseButtonReleased(MOUSE_LEFT_BUTTON) && !state->mouseMovedSinceClick);
 
     if (performDrawPass) {
-        BeginTextureMode(*drawOutputTarget);
+        BeginTextureMode(state->drawSurface);
         // Don't clear, accumulate drawing
         BeginShaderMode(state->drawShader);
             // Set uniforms for drawing shader
@@ -739,23 +683,17 @@ void DrawApp(AppState *state, int width, int height) {
             int isDrawingShaderFlag = 1; // Tell shader to draw this segment
             SetShaderValue(state->drawShader, state->draw_loc_isDrawing, &isDrawingShaderFlag, SHADER_UNIFORM_INT);
             // Bind the input texture (previous frame's drawing)
-            SetShaderValueTexture(state->drawShader, state->draw_loc_inputTexture, drawInputTarget->texture);
+            SetShaderValueTexture(state->drawShader, state->draw_loc_inputTexture, state->drawSurface.texture);
 
             DrawQuad(state); // Draw fullscreen quad to apply shader
 
         EndShaderMode();
         EndTextureMode();
-        state->drawPingPong = !state->drawPingPong; // Swap buffers for next frame
 
         // Update lastMousePos *after* using it in the shader for the current segment
         // Only update if drawing continues
          if (state->isDrawing) state->lastMousePos = state->currentMousePos;
 
-    } else {
-         // If not drawing, the output target remains the same as the last valid input
-         // No need to swap ping pong flag if no draw pass occurred.
-         // drawOutputTarget still points to the latest drawing result.
-         drawOutputTarget = drawInputTarget; // Ensure drawOutputTarget points to the latest valid drawing
     }
 
 
@@ -763,7 +701,7 @@ void DrawApp(AppState *state, int width, int height) {
     BeginTextureMode(state->seedTexture);
     ClearBackground(BLANK); // Clear seed texture before drawing
     BeginShaderMode(state->seedShader);
-        SetShaderValueTexture(state->seedShader, state->seed_loc_surfaceTexture, drawOutputTarget->texture);
+        SetShaderValueTexture(state->seedShader, state->seed_loc_surfaceTexture, state->drawSurface.texture);
         DrawQuad(state);
     EndShaderMode();
     EndTextureMode();
@@ -810,7 +748,7 @@ void DrawApp(AppState *state, int width, int height) {
     ClearBackground(BLACK); // Clear before drawing GI
     BeginShaderMode(state->giShader);
         // Set Textures
-        SetShaderValueTexture(state->giShader, state->gi_loc_sceneTexture, drawOutputTarget->texture); // Use latest drawing output
+        SetShaderValueTexture(state->giShader, state->gi_loc_sceneTexture, state->drawSurface.texture); // Use latest drawing output
         SetShaderValueTexture(state->giShader, state->gi_loc_distanceTexture, state->distanceFieldTexture.texture);
         SetShaderValueTexture(state->giShader, state->gi_loc_lastFrameTexture, giInputTarget->texture); // Previous GI frame
 
@@ -837,16 +775,28 @@ void DrawApp(AppState *state, int width, int height) {
 
     // --- Final Draw to Screen ---
     BeginDrawing();
-    ClearBackground(RAYWHITE); // Clear screen background
+    ClearBackground(PINK); // Clear screen background
 
-    // Draw the final GI result (from giOutputTarget) to the screen
-     DrawTexturePro(giOutputTarget->texture,
-                   (Rectangle){ 0.0f, 0.0f, (float)giOutputTarget->texture.width, -(float)giOutputTarget->texture.height }, // Source Rec (flip Y)
-                   (Rectangle){ 0.0f, 0.0f, (float)width, (float)height }, // Destination Rec (stretch to screen)
-                   (Vector2){ 0, 0 }, // Origin
-                   0.0f, // Rotation
-                   WHITE); // Tint
 
+    // Draw the final result to the screen
+
+    constexpr int nViews = 5;
+    Texture debugViews[nViews] {
+        giOutputTarget->texture,
+        state->drawSurface.texture,
+        state->seedTexture.texture,
+        currentJfaInput,
+        state->distanceFieldTexture.texture,
+    };
+    if (IsKeyPressed(KEY_RIGHT))
+        state->debugView = (state->debugView + 1) % nViews;
+    if (IsKeyPressed(KEY_LEFT))
+        state->debugView = (state->debugView - 1 + nViews) % nViews;
+
+    DrawTexturePro(debugViews[state->debugView],
+                   (Rectangle){ 0.0f, 0.0f, (float)giOutputTarget->texture.width, (float)giOutputTarget->texture.height }, // Source Rectangle (no Y flip, handled in the vertex shader)
+                   (Rectangle){ 0.0f, 0.0f, (float)width, (float)height }, // Destination Rectangle (stretch to screen)
+                   (Vector2){ 0, 0 }, 0.0f, WHITE); // Offset, rotation, vertex colors (unused)
 
     // --- Draw UI Controls ---
     int currentY = 10;
@@ -855,6 +805,7 @@ void DrawApp(AppState *state, int width, int height) {
     int guiWidth = 200;
     int sliderWidth = 120;
     Rectangle guiArea = {(float)width - guiWidth - guiMargin, 0, (float)guiWidth + guiMargin, (float)height}; // Area for UI
+    //DrawRectangleRec(guiArea, ColorAlpha(GRAY, 0.5f)); // Add a background to signal drawing here won't work to the user
 
     GuiCheckBox((Rectangle){guiArea.x, (float)currentY, (float)guiHeight, (float)guiHeight}, "Enable Noise", &state->showNoise);
     currentY += guiHeight + guiMargin / 2;
@@ -892,8 +843,7 @@ void DrawApp(AppState *state, int width, int height) {
 
 void DeInitApp(AppState *state) {
     // Unload Textures
-    UnloadRenderTexture(state->drawSurfaceA);
-    UnloadRenderTexture(state->drawSurfaceB);
+    UnloadRenderTexture(state->drawSurface);
     UnloadRenderTexture(state->seedTexture);
     UnloadRenderTexture(state->jfaTextureA);
     UnloadRenderTexture(state->jfaTextureB);
@@ -907,8 +857,4 @@ void DeInitApp(AppState *state) {
     UnloadShader(state->jfaShader);
     UnloadShader(state->distanceFieldShader);
     UnloadShader(state->giShader);
-
-    // Unload VBO (VAO is managed by rlgl if not explicitly created)
-    rlUnloadVertexBuffer(state->quadVBO);
-    // if (state->quadVAO > 0) rlUnloadVertexArray(state->quadVAO); // If VAO was explicitly loaded
 }

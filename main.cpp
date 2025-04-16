@@ -3,7 +3,7 @@
 * Raylib Global Illumination, adapted to c++/raylib/opengl from the excellent 
 * js/threejs/webgl interractive article at https://jason.today/gi
 *
-* With help from Gemini 2.5 pro to bootstrap the plumbing
+* With help from Gemini 2.5 pro to bootstrap the plumbing (= the first git commit)
 *
 * Core Pipeline:
 * 1. Drawing Surface: User draws onto a texture using the mouse.
@@ -16,6 +16,7 @@
 
 #include "raylib.h"
 #include "raymath.h" // For Vector2DistanceSqr
+#include "rlgl.h"
 #define RAYGUI_IMPLEMENTATION
 #include "raygui.h" // For checkboxes, buttons and sliders
 
@@ -473,6 +474,50 @@ bool CheckShader(Shader shader)
     return !(shader.id == 0 || shader.id == defaultShader.id || !IsShaderValid(shader));
 }
 
+// Same as LoadRenderTexture, but enables choosing the pixel data format and removing the depth attachment
+RenderTexture2D LoadRenderTextureEx(
+    int width, int height, PixelFormat format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, bool addDepth = true
+) {
+    RenderTexture2D target = { 0 };
+
+    target.id = rlLoadFramebuffer(); // Load an empty framebuffer
+
+    if (target.id > 0)
+    {
+        rlEnableFramebuffer(target.id);
+
+        // Create color texture (default to RGBA)
+        target.texture.id = rlLoadTexture(NULL, width, height, format, 1);
+        target.texture.width = width;
+        target.texture.height = height;
+        target.texture.format = format;
+        target.texture.mipmaps = 1;
+
+        // Create depth renderbuffer/texture
+        if (addDepth)
+        {
+            target.depth.id = rlLoadTextureDepth(width, height, true);
+            target.depth.width = width;
+            target.depth.height = height;
+            target.depth.format = 19;       //DEPTH_COMPONENT_24BIT?
+            target.depth.mipmaps = 1;
+        }
+
+        // Attach color texture and depth renderbuffer/texture to FBO
+        rlFramebufferAttach(target.id, target.texture.id, RL_ATTACHMENT_COLOR_CHANNEL0, RL_ATTACHMENT_TEXTURE2D, 0);
+        if (addDepth)
+            rlFramebufferAttach(target.id, target.depth.id, RL_ATTACHMENT_DEPTH, RL_ATTACHMENT_RENDERBUFFER, 0);
+
+        // Check if fbo is complete with attachments (valid)
+        if (rlFramebufferComplete(target.id)) TRACELOG(LOG_INFO, "FBO: [ID %i] Framebuffer object created successfully", target.id);
+
+        rlDisableFramebuffer();
+    }
+    else TRACELOG(LOG_WARNING, "FBO: Framebuffer object can not be created");
+
+    return target;
+}
+
 void InitApp(AppState *state, int width, int height) {
     // --- Initialize State ---
     state->lastMousePos = GetMousePosition();
@@ -559,33 +604,35 @@ void InitApp(AppState *state, int width, int height) {
 
 
     // --- Create Render Targets ---
-    // Use standard 8-bit format for drawing surface and final result
+    // Use standard 8-bit integers format for drawing surface and final result
     state->drawSurface = LoadRenderTexture(width, height);
-    SetTextureFilter(state->drawSurface.texture, TEXTURE_FILTER_POINT);
     SetTextureWrap(state->drawSurface.texture, TEXTURE_WRAP_CLAMP);
 
     state->giResultA = LoadRenderTexture(width, height);
     state->giResultB = LoadRenderTexture(width, height);
-    SetTextureFilter(state->giResultA.texture, TEXTURE_FILTER_POINT);
-    SetTextureFilter(state->giResultB.texture, TEXTURE_FILTER_POINT);
+    SetTextureFilter(state->giResultA.texture, TEXTURE_FILTER_BILINEAR);
+    SetTextureFilter(state->giResultB.texture, TEXTURE_FILTER_BILINEAR);
     SetTextureWrap(state->giResultA.texture, TEXTURE_WRAP_CLAMP);
     SetTextureWrap(state->giResultB.texture, TEXTURE_WRAP_CLAMP);
 
 
-    // TODO: investigate the need for higher precision texture datatypes?
-    state->seedTexture = LoadRenderTexture(width, height); // Use default format
-    SetTextureFilter(state->seedTexture.texture, TEXTURE_FILTER_POINT);
+    // Use floating points for the seed, jfa, and distance field textures
+    // I'd rather use 16-bit integers, but rlgl do not expose them, and 16-bit floats silently drop the raymarching on my machine
+    // So off we go to 32-bit floats
+    // Also drop the depth attachment since I don't use it
+    state->seedTexture = LoadRenderTextureEx(width, height, PIXELFORMAT_UNCOMPRESSED_R32G32B32, false);
+    SetTextureFilter(state->seedTexture.texture, TEXTURE_FILTER_BILINEAR);
     SetTextureWrap(state->seedTexture.texture, TEXTURE_WRAP_CLAMP);
 
-    state->jfaTextureA = LoadRenderTexture(width, height); // Use default format
-    state->jfaTextureB = LoadRenderTexture(width, height); // Use default format
-    SetTextureFilter(state->jfaTextureA.texture, TEXTURE_FILTER_POINT);
-    SetTextureFilter(state->jfaTextureB.texture, TEXTURE_FILTER_POINT);
+    state->jfaTextureA = LoadRenderTextureEx(width, height, PIXELFORMAT_UNCOMPRESSED_R32G32B32, false);
+    state->jfaTextureB = LoadRenderTextureEx(width, height, PIXELFORMAT_UNCOMPRESSED_R32G32B32, false);
+    SetTextureFilter(state->jfaTextureA.texture, TEXTURE_FILTER_BILINEAR);
+    SetTextureFilter(state->jfaTextureB.texture, TEXTURE_FILTER_BILINEAR);
     SetTextureWrap(state->jfaTextureA.texture, TEXTURE_WRAP_CLAMP);
     SetTextureWrap(state->jfaTextureB.texture, TEXTURE_WRAP_CLAMP);
 
-    state->distanceFieldTexture = LoadRenderTexture(width, height); // Use default format
-    SetTextureFilter(state->distanceFieldTexture.texture, TEXTURE_FILTER_POINT);
+    state->distanceFieldTexture = LoadRenderTextureEx(width, height, PIXELFORMAT_UNCOMPRESSED_R32, false);
+    SetTextureFilter(state->distanceFieldTexture.texture, TEXTURE_FILTER_BILINEAR);
     SetTextureWrap(state->distanceFieldTexture.texture, TEXTURE_WRAP_CLAMP);
 
 
